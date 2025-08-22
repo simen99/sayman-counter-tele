@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS invite_counts (
   count INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (chat_id, inviter_user_id)
 );
+-- Tabel berikut sebenarnya TIDAK dipakai lagi untuk multi-admin,
+-- tapi boleh dibiarkan agar tidak mengubah struktur lain.
 CREATE TABLE IF NOT EXISTS group_admin_receiver (
   chat_id INTEGER PRIMARY KEY,
   admin_user_id INTEGER NOT NULL
@@ -42,12 +44,11 @@ const getMyCount = db.prepare(
 const resetCount = db.prepare(
   `DELETE FROM invite_counts WHERE chat_id = ? AND inviter_user_id = ?`
 );
+
+// Masih ada biar /start lama tidak error, walau tidak dipakai untuk kirim DM
 const setAdminReceiver = db.prepare(
   `INSERT INTO group_admin_receiver(chat_id, admin_user_id) VALUES(?, ?)
    ON CONFLICT(chat_id) DO UPDATE SET admin_user_id = excluded.admin_user_id`
-);
-const getAdminReceiver = db.prepare(
-  `SELECT admin_user_id FROM group_admin_receiver WHERE chat_id = ?`
 );
 
 // ---------- Helper ----------
@@ -63,9 +64,9 @@ function nowTime() {
   return d.toTimeString().slice(0,8); // HH:MM:SS
 }
 
+// Ambil semua admin manusia di grup (non-bot)
 async function getGroupAdminIds(telegram, chatId) {
   const admins = await telegram.getChatAdministrators(chatId);
-  // Ambil semua admin non-bot
   return admins
     .map(a => a.user)
     .filter(u => !u.is_bot)
@@ -73,14 +74,20 @@ async function getGroupAdminIds(telegram, chatId) {
 }
 
 // ---------- Commands ----------
-// /start di grup → set admin penerima laporan untuk grup tsb
+// /start di grup → biar ada konfirmasi siap pakai
 bot.command("start", async (ctx) => {
   if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
-    return ctx.reply("Hi! Tambahkan aku ke grup dan jalankan /start di grup untuk mengaktifkan laporan.\nHi! Add me to a group and run /start there to enable reports.");
+    return ctx.reply(
+      "Hi! Tambahkan aku ke grup dan jalankan /start di grup untuk mengaktifkan laporan.\n" +
+      "Hi! Add me to a group and run /start there to enable reports."
+    );
   }
+  // Boleh dihapus kalau mau bersih total dari single-admin mode
   setAdminReceiver.run(ctx.chat.id, ctx.from.id);
+
   await ctx.reply(
-    `✅ Bot siap digunakan. Laporan akan dikirim ke ${mention(ctx.from)}.\n✅ Bot is ready. Reports will be sent to ${mention(ctx.from)}.`,
+    "✅ Bot siap digunakan. Laporan akan dikirim via DM ke semua admin (yang sudah /start bot di DM).\n" +
+    "✅ Bot is ready. Reports will be sent via DM to all group admins (who have /start me in DM).",
     { parse_mode: "Markdown" }
   );
 });
@@ -118,35 +125,47 @@ bot.on("chat_member", async (ctx) => {
     const row = getMyCount.get(chat.id, actor.id);
     const total = row ? row.count : 1;
 
-    // Kirim laporan ke admin penerima grup
+    // Teks laporan
+    const text =
+      `👤 Username : ${newm.user.first_name || newm.user.username || newm.user.id}\n` +
+      `🆔 User ID : ${atUsername(newm.user)}\n` +
+      `👥 Pengundang / Adder : ${mention(actor)}\n` +
+      `📊 Total undangan (adder) : ${total}\n` +
+      `⏰ Last Update : ${nowTime()}\n` +
+      `👥 Grup : ${chat.title || chat.id}`;
+
+    const kb = Markup.inlineKeyboard([
+      [Markup.button.callback("🔁 Reset", `reset:${chat.id}:${actor.id}`)],
+    ]);
+
     // Kirim laporan ke SEMUA admin manusia di grup
-const text =
-  `👤 Username : ${newm.user.first_name || newm.user.username || newm.user.id}\n` +
-  `🆔 User ID : ${atUsername(newm.user)}\n` +
-  `👥 Pengundang / Adder : ${mention(actor)}\n` +
-  `📊 Total undangan (adder) : ${total}\n` +
-  `⏰ Last Update : ${nowTime()}\n` +
-  `👥 Grup : ${chat.title || chat.id}`;
-
-const kb = Markup.inlineKeyboard([
-  [Markup.button.callback("🔁 Reset", `reset:${chat.id}:${actor.id}`)],
-]);
-
-try {
-  const adminIds = await getGroupAdminIds(ctx.telegram, chat.id);
-  for (const adminId of adminIds) {
     try {
-      await ctx.telegram.sendMessage(adminId, text, {
-        parse_mode: "Markdown",
-        ...kb,
-      });
+      const adminIds = await getGroupAdminIds(ctx.telegram, chat.id);
+      for (const adminId of adminIds) {
+        try {
+          await ctx.telegram.sendMessage(adminId, text, {
+            parse_mode: "Markdown",
+            ...kb,
+          });
+        } catch (e) {
+          // 403: admin belum pernah /start di DM → abaikan
+        }
+      }
     } catch (e) {
-      // 403: admin belum pernah /start di DM → abaikan
+      console.error("send to admins error:", e);
     }
+
+    // (Opsional) juga umumkan ringkas di grup (non-spam)
+    // await ctx.telegram.sendMessage(
+    //   chat.id,
+    //   `➕ ${mention(actor)} menambahkan ${mention(newm.user)} • total undangan ${total}`,
+    //   { parse_mode: "Markdown", disable_notification: true }
+    // );
+
+  } catch (err) {
+    console.error("chat_member handler error:", err);
   }
-} catch (e) {
-  console.error("send to admins error:", e);
-}
+});
 
 // ---------- Reset handler (admin only) ----------
 bot.on("callback_query", async (ctx) => {
@@ -166,6 +185,7 @@ bot.on("callback_query", async (ctx) => {
   resetCount.run(chatId, inviterId);
   await ctx.editMessageText("✅ Counter direset.");
 });
+
 // ---------- Webhook server ----------
 const app = express();
 app.use(express.json());
