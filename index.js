@@ -142,6 +142,20 @@ async function safeCall(fn) {
   }
 }
 
+// ---- Per-key async lock to serialize operations ----
+const opQueues = new Map(); // key -> Promise
+
+function withKeyLock(key, fn) {
+  const prev = opQueues.get(key) || Promise.resolve();
+  // chain agar antrian per key dieksekusi berurutan
+  const next = prev.catch(() => {}).then(fn).finally(() => {
+    // bersihkan jika ini adalah tail saat ini
+    if (opQueues.get(key) === next) opQueues.delete(key);
+  });
+  opQueues.set(key, next);
+  return next;
+}
+
 // ---------- Commands ----------
 bot.command("start", async (ctx) => {
   // Private: supaya admin bisa terima DM
@@ -232,48 +246,44 @@ bot.on("chat_member", async (ctx) => {
     const adminIds = await getGroupAdminIds(ctx.telegram, chat.id);
 
     for (const adminId of adminIds) {
-      try {
-        const exist = getReportMsg.get(chat.id, actor.id, adminId);
+  const key = `${chat.id}:${actor.id}:${adminId}`;
+  await withKeyLock(key, async () => {
+    try {
+      const exist = getReportMsg.get(chat.id, actor.id, adminId);
 
-        if (exist?.message_id) {
-          // Edit pesan lama
-          await safeCall(() =>
-            ctx.telegram.editMessageText(
-              adminId,            // DM ke admin
-              exist.message_id,   // message id tersimpan
-              undefined,
-              text,
-              { parse_mode: "Markdown", ...kb }
-            )
-          );
-        } else {
-          // Kirim pertama kali, simpan message_id
+      if (exist?.message_id) {
+        // Edit pesan lama
+        await safeCall(() =>
+          ctx.telegram.editMessageText(
+            adminId,
+            exist.message_id,
+            undefined,
+            text,
+            { parse_mode: "Markdown", ...kb }
+          )
+        );
+      } else {
+        // Kirim pertama kali, simpan message_id
+        const sent = await safeCall(() =>
+          ctx.telegram.sendMessage(adminId, text, { parse_mode: "Markdown", ...kb })
+        );
+        upsertReportMsg.run(chat.id, actor.id, adminId, sent.message_id);
+      }
+    } catch (e) {
+      // 403: admin belum /start DM → abaikan
+      // 400 (message deleted) → kirim baru + simpan id
+      const code = e?.response?.error_code || e?.code;
+      if (code === 400) {
+        try {
           const sent = await safeCall(() =>
             ctx.telegram.sendMessage(adminId, text, { parse_mode: "Markdown", ...kb })
           );
           upsertReportMsg.run(chat.id, actor.id, adminId, sent.message_id);
-        }
-      } catch (e) {
-        // 403: admin belum pernah /start bot di DM → abaikan
-        // 400: MESSAGE_ID_INVALID (pesan lama dihapus) → fallback kirim baru
-        const code = e?.response?.error_code || e?.code;
-        if (code === 400) {
-          try {
-            const sent = await safeCall(() =>
-              ctx.telegram.sendMessage(adminId, text, { parse_mode: "Markdown", ...kb })
-            );
-            upsertReportMsg.run(chat.id, actor.id, adminId, sent.message_id);
-          } catch {}
-        }
+        } catch {}
       }
     }
-
-    // (Opsional) Umumkan ringkas di grup (non-spam):
-    // await ctx.telegram.sendMessage(
-    //   chat.id,
-    //   `➕ ${mention(actor)} menambahkan ${mention(newm.user)} • total undangan ${total}`,
-    //   { parse_mode: "Markdown", disable_notification: true }
-    // );
+  });
+}
 
   } catch (err) {
     console.error("chat_member handler error:", err);
