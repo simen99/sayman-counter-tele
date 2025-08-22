@@ -1,0 +1,158 @@
+import express from "express";
+import { Telegraf, Markup } from "telegraf";
+import Database from "better-sqlite3";
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const PORT = process.env.PORT || 3000;
+
+if (!BOT_TOKEN || !WEBHOOK_URL) {
+  console.error("Harap set BOT_TOKEN dan WEBHOOK_URL di environment.");
+  process.exit(1);
+}
+
+const bot = new Telegraf(BOT_TOKEN, { handlerTimeout: 10_000 });
+await bot.telegram.setWebhook(WEBHOOK_URL, {
+  allowed_updates: ["message", "chat_member", "callback_query", "my_chat_member"],
+});
+
+// ---------- DB ----------
+const db = new Database("data.db");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS invite_counts (
+  chat_id INTEGER NOT NULL,
+  inviter_user_id INTEGER NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (chat_id, inviter_user_id)
+);
+CREATE TABLE IF NOT EXISTS group_admin_receiver (
+  chat_id INTEGER PRIMARY KEY,
+  admin_user_id INTEGER NOT NULL
+);
+`);
+
+const incCount = db.prepare(
+  `INSERT INTO invite_counts(chat_id, inviter_user_id, count) VALUES(?, ?, 1)
+   ON CONFLICT(chat_id, inviter_user_id) DO UPDATE SET count = count + 1`
+);
+const getMyCount = db.prepare(
+  `SELECT count FROM invite_counts WHERE chat_id = ? AND inviter_user_id = ?`
+);
+const resetCount = db.prepare(
+  `DELETE FROM invite_counts WHERE chat_id = ? AND inviter_user_id = ?`
+);
+const setAdminReceiver = db.prepare(
+  `INSERT INTO group_admin_receiver(chat_id, admin_user_id) VALUES(?, ?)
+   ON CONFLICT(chat_id) DO UPDATE SET admin_user_id = excluded.admin_user_id`
+);
+const getAdminReceiver = db.prepare(
+  `SELECT admin_user_id FROM group_admin_receiver WHERE chat_id = ?`
+);
+
+// ---------- Helper ----------
+function mention(user) {
+  const name = [user.first_name, user.last_name].filter(Boolean).join(" ") || user.username || "user";
+  return `[${name}](tg://user?id=${user.id})`;
+}
+function atUsername(user) {
+  return user.username ? `@${user.username}` : `(no username)`;
+}
+function nowTime() {
+  const d = new Date();
+  return d.toTimeString().slice(0,8); // HH:MM:SS
+}
+
+// ---------- Commands ----------
+// /start di grup → set admin penerima laporan untuk grup tsb
+bot.command("start", async (ctx) => {
+  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
+    return ctx.reply("Hi! Tambahkan aku ke grup dan jalankan /start di grup untuk mengaktifkan laporan.\nHi! Add me to a group and run /start there to enable reports.");
+  }
+  setAdminReceiver.run(ctx.chat.id, ctx.from.id);
+  await ctx.reply(
+    `✅ Bot siap digunakan. Laporan akan dikirim ke ${mention(ctx.from)}.\n✅ Bot is ready. Reports will be sent to ${mention(ctx.from)}.`,
+    { parse_mode: "Markdown" }
+  );
+});
+
+// Optional: cek stats pribadi di grup
+bot.command("mystats", async (ctx) => {
+  if (!ctx.chat || (ctx.chat.type === "private")) return ctx.reply("Gunakan perintah ini di dalam grup.");
+  const row = getMyCount.get(ctx.chat.id, ctx.from.id);
+  const c = row ? row.count : 0;
+  await ctx.replyWithMarkdown(`Total undangan *${c}* untuk ${mention(ctx.from)} di grup ini.`);
+});
+
+// ---------- Event: member added (manual) ----------
+bot.on("chat_member", async (ctx) => {
+  try {
+    const upd = ctx.update.chat_member;
+    const chat = upd.chat;
+    const newm = upd.new_chat_member;
+    const oldm = upd.old_chat_member;
+    const actor = upd.from; // si A yang melakukan aksi add/kick/promote, dst
+
+    const becameMember = oldm.status !== "member" && newm.status === "member";
+    if (!becameMember) return;
+
+    // 1) Ignore jika join via link
+    if (upd.invite_link && upd.invite_link.invite_link) return;
+
+    // 2) Ignore jika join sendiri (aktor = user baru)
+    if (actor && actor.id === newm.user.id) return;
+
+    // 3) Hitung ke aktor (A menambahkan B)
+    if (!actor) return;
+    incCount.run(chat.id, actor.id);
+
+    const row = getMyCount.get(chat.id, actor.id);
+    const total = row ? row.count : 1;
+
+    // Kirim laporan ke admin penerima grup
+    const adminRec = getAdminReceiver.get(chat.id);
+    if (adminRec?.admin_user_id) {
+      const text = 
+        `👤 Username : ${newm.user.first_name || newm.user.username || newm.user.id}\n` +
+        `🆔 User ID : ${atUsername(newm.user)}\n` +
+        `👥 Pengundang / Adder : ${mention(actor)}\n` +
+        `📊 Total undangan (adder) : ${total}\n` +
+        `⏰ Last Update : ${nowTime()}\n` +
+        `👥 Grup : ${chat.title || chat.id}`;
+
+      const kb = Markup.inlineKeyboard([
+        [Markup.button.callback("🔁 Reset", `reset:${chat.id}:${actor.id}`)],
+      ]);
+
+      await ctx.telegram.sendMessage(adminRec.admin_user_id, text, {
+        parse_mode: "Markdown",
+        ...kb,
+      });
+    }
+  } catch (err) {
+    console.error("chat_member handler error:", err);
+  }
+});
+
+// ---------- Reset handler (admin only) ----------
+bot.on("callback_query", async (ctx) => {
+  const data = ctx.callbackQuery?.data || "";
+  if (!data.startsWith("reset:")) return ctx.answerCbQuery();
+  const [, chatIdStr, inviterIdStr] = data.split(":");
+  const chatId = Number(chatIdStr);
+  const inviterId = Number(inviterIdStr);
+
+  const adminRec = getAdminReceiver.get(chatId);
+  if (!adminRec || ctx.from.id !== adminRec.admin_user_id) {
+    return ctx.answerCbQuery("Hanya admin penerima yang dapat reset.", { show_alert: true });
+  }
+  resetCount.run(chatId, inviterId);
+  await ctx.editMessageText("✅ Counter direset.");
+});
+
+// ---------- Webhook server ----------
+const app = express();
+app.use(express.json());
+app.post("/telegram", (req, res) => { bot.handleUpdate(req.body).then(() => res.sendStatus(200)); });
+app.get("/health", (req, res) => res.send("OK"));
+app.listen(PORT, () => console.log(`Bot listening on port ${PORT}`));
