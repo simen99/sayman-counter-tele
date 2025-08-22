@@ -63,6 +63,15 @@ function nowTime() {
   return d.toTimeString().slice(0,8); // HH:MM:SS
 }
 
+async function getGroupAdminIds(telegram, chatId) {
+  const admins = await telegram.getChatAdministrators(chatId);
+  // Ambil semua admin non-bot
+  return admins
+    .map(a => a.user)
+    .filter(u => !u.is_bot)
+    .map(u => u.id);
+}
+
 // ---------- Commands ----------
 // /start di grup → set admin penerima laporan untuk grup tsb
 bot.command("start", async (ctx) => {
@@ -110,46 +119,53 @@ bot.on("chat_member", async (ctx) => {
     const total = row ? row.count : 1;
 
     // Kirim laporan ke admin penerima grup
-    const adminRec = getAdminReceiver.get(chat.id);
-    if (adminRec?.admin_user_id) {
-      const text = 
-        `👤 Username : ${newm.user.first_name || newm.user.username || newm.user.id}\n` +
-        `🆔 User ID : ${atUsername(newm.user)}\n` +
-        `👥 Pengundang / Adder : ${mention(actor)}\n` +
-        `📊 Total undangan (adder) : ${total}\n` +
-        `⏰ Last Update : ${nowTime()}\n` +
-        `👥 Grup : ${chat.title || chat.id}`;
+    // Kirim laporan ke SEMUA admin manusia di grup
+const text =
+  `👤 Username : ${newm.user.first_name || newm.user.username || newm.user.id}\n` +
+  `🆔 User ID : ${atUsername(newm.user)}\n` +
+  `👥 Pengundang / Adder : ${mention(actor)}\n` +
+  `📊 Total undangan (adder) : ${total}\n` +
+  `⏰ Last Update : ${nowTime()}\n` +
+  `👥 Grup : ${chat.title || chat.id}`;
 
-      const kb = Markup.inlineKeyboard([
-        [Markup.button.callback("🔁 Reset", `reset:${chat.id}:${actor.id}`)],
-      ]);
+const kb = Markup.inlineKeyboard([
+  [Markup.button.callback("🔁 Reset", `reset:${chat.id}:${actor.id}`)],
+]);
 
-      await ctx.telegram.sendMessage(adminRec.admin_user_id, text, {
+try {
+  const adminIds = await getGroupAdminIds(ctx.telegram, chat.id);
+  for (const adminId of adminIds) {
+    try {
+      await ctx.telegram.sendMessage(adminId, text, {
         parse_mode: "Markdown",
         ...kb,
       });
+    } catch (e) {
+      // 403: admin belum pernah /start di DM → abaikan
     }
-  } catch (err) {
-    console.error("chat_member handler error:", err);
   }
-});
+} catch (e) {
+  console.error("send to admins error:", e);
+}
 
 // ---------- Reset handler (admin only) ----------
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery?.data || "";
   if (!data.startsWith("reset:")) return ctx.answerCbQuery();
+
   const [, chatIdStr, inviterIdStr] = data.split(":");
   const chatId = Number(chatIdStr);
   const inviterId = Number(inviterIdStr);
 
-  const adminRec = getAdminReceiver.get(chatId);
-  if (!adminRec || ctx.from.id !== adminRec.admin_user_id) {
-    return ctx.answerCbQuery("Hanya admin penerima yang dapat reset.", { show_alert: true });
+  // Hanya admin manusia di grup tsb yang boleh reset
+  const adminIds = await getGroupAdminIds(ctx.telegram, chatId);
+  if (!adminIds.includes(ctx.from.id)) {
+    return ctx.answerCbQuery("Hanya admin grup yang dapat reset.", { show_alert: true });
   }
+
   resetCount.run(chatId, inviterId);
   await ctx.editMessageText("✅ Counter direset.");
 });
-
 // ---------- Webhook server ----------
 const app = express();
 app.use(express.json());
