@@ -93,12 +93,11 @@ async function getGroupAdminIds(telegram, chatId) {
     .map(u => u.id);
 }
 
-function buildReportText({ chat, actor, newUser, total }) {
+function buildReportText({ chat, actor, total }) {
   return (
-    `👤 Username : ${newUser.first_name || newUser.username || newUser.id}\n` +
-    `🆔 User ID : ${newUser.username ? '@' + newUser.username : '(no username)'}\n` +
-    `👥 Pengundang / Adder : ${mention(actor)}\n` +
-    `📊 Total undangan (adder) : ${total}\n` +
+    `👥 Pengundang : ${mention(actor)}\n` +
+    `🔖 Username Pengundang : ${actor.username ? '@' + actor.username : '(username privat)'}\n` +
+    `📊 Total undangan : ${total}\n` +
     `⏰ Last Update : ${nowTime()}\n` +
     `👥 Grup : ${chat.title || chat.id}`
   );
@@ -155,7 +154,7 @@ bot.on("chat_member", async (ctx) => {
     const total = row ? row.count : 1;
 
     // Siapkan teks & tombol
-    const text = buildReportText({ chat, actor, newUser: newm.user, total });
+    const text = buildReportText({ chat, actor, total });
     const kb = Markup.inlineKeyboard([
       [Markup.button.callback("🔁 Reset", `reset:${chat.id}:${actor.id}`)],
     ]);
