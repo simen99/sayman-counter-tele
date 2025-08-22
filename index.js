@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS invite_counts (
   count INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (chat_id, inviter_user_id)
 );
+
+CREATE TABLE IF NOT EXISTS invite_reports (
+  chat_id INTEGER NOT NULL,
+  inviter_user_id INTEGER NOT NULL,
+  admin_user_id INTEGER NOT NULL,
+  message_id INTEGER NOT NULL,
+  PRIMARY KEY (chat_id, inviter_user_id, admin_user_id)
+);
+
 -- Tabel berikut sebenarnya TIDAK dipakai lagi untuk multi-admin,
 -- tapi boleh dibiarkan agar tidak mengubah struktur lain.
 CREATE TABLE IF NOT EXISTS group_admin_receiver (
@@ -51,6 +60,17 @@ const setAdminReceiver = db.prepare(
    ON CONFLICT(chat_id) DO UPDATE SET admin_user_id = excluded.admin_user_id`
 );
 
+// Simpan message_id DM per (chat_id, inviter_user_id, admin_user_id)
+const getReportMsg = db.prepare(
+  `SELECT message_id FROM invite_reports WHERE chat_id = ? AND inviter_user_id = ? AND admin_user_id = ?`
+);
+const upsertReportMsg = db.prepare(
+  `INSERT INTO invite_reports (chat_id, inviter_user_id, admin_user_id, message_id)
+   VALUES (?, ?, ?, ?)
+   ON CONFLICT(chat_id, inviter_user_id, admin_user_id)
+   DO UPDATE SET message_id = excluded.message_id`
+);
+
 // ---------- Helper ----------
 function mention(user) {
   const name = [user.first_name, user.last_name].filter(Boolean).join(" ") || user.username || "user";
@@ -73,8 +93,18 @@ async function getGroupAdminIds(telegram, chatId) {
     .map(u => u.id);
 }
 
+function buildReportText({ chat, actor, newUser, total }) {
+  return (
+    `👤 Username : ${newUser.first_name || newUser.username || newUser.id}\n` +
+    `🆔 User ID : ${newUser.username ? '@' + newUser.username : '(no username)'}\n` +
+    `👥 Pengundang / Adder : ${mention(actor)}\n` +
+    `📊 Total undangan (adder) : ${total}\n` +
+    `⏰ Last Update : ${nowTime()}\n` +
+    `👥 Grup : ${chat.title || chat.id}`
+  );
+}
+
 // ---------- Commands ----------
-// /start di grup → biar ada konfirmasi siap pakai
 bot.command("start", async (ctx) => {
   if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
     return ctx.reply(
@@ -92,7 +122,6 @@ bot.command("start", async (ctx) => {
   );
 });
 
-// Optional: cek stats pribadi di grup
 bot.command("mystats", async (ctx) => {
   if (!ctx.chat || (ctx.chat.type === "private")) return ctx.reply("Gunakan perintah ini di dalam grup.");
   const row = getMyCount.get(ctx.chat.id, ctx.from.id);
@@ -107,15 +136,15 @@ bot.on("chat_member", async (ctx) => {
     const chat = upd.chat;
     const newm = upd.new_chat_member;
     const oldm = upd.old_chat_member;
-    const actor = upd.from; // si A yang melakukan aksi add/kick/promote, dst
+    const actor = upd.from; // si A yang melakukan aksi add
 
     const becameMember = oldm.status !== "member" && newm.status === "member";
     if (!becameMember) return;
 
-    // 1) Ignore jika join via link
+    // 1) Abaikan join via link
     if (upd.invite_link && upd.invite_link.invite_link) return;
 
-    // 2) Ignore jika join sendiri (aktor = user baru)
+    // 2) Abaikan join sendiri (aktor = user baru)
     if (actor && actor.id === newm.user.id) return;
 
     // 3) Hitung ke aktor (A menambahkan B)
@@ -125,37 +154,39 @@ bot.on("chat_member", async (ctx) => {
     const row = getMyCount.get(chat.id, actor.id);
     const total = row ? row.count : 1;
 
-    // Teks laporan
-    const text =
-      `👤 Username : ${newm.user.first_name || newm.user.username || newm.user.id}\n` +
-      `🆔 User ID : ${atUsername(newm.user)}\n` +
-      `👥 Pengundang / Adder : ${mention(actor)}\n` +
-      `📊 Total undangan (adder) : ${total}\n` +
-      `⏰ Last Update : ${nowTime()}\n` +
-      `👥 Grup : ${chat.title || chat.id}`;
-
+    // Siapkan teks & tombol
+    const text = buildReportText({ chat, actor, newUser: newm.user, total });
     const kb = Markup.inlineKeyboard([
       [Markup.button.callback("🔁 Reset", `reset:${chat.id}:${actor.id}`)],
     ]);
 
-    // Kirim laporan ke SEMUA admin manusia di grup
-    try {
-      const adminIds = await getGroupAdminIds(ctx.telegram, chat.id);
-      for (const adminId of adminIds) {
-        try {
-          await ctx.telegram.sendMessage(adminId, text, {
-            parse_mode: "Markdown",
-            ...kb,
-          });
-        } catch (e) {
-          // 403: admin belum pernah /start di DM → abaikan
+    // Kirim ke SEMUA admin manusia, mode "single output": edit-or-send per (inviter, admin)
+    const adminIds = await getGroupAdminIds(ctx.telegram, chat.id);
+
+    for (const adminId of adminIds) {
+      try {
+        const exist = getReportMsg.get(chat.id, actor.id, adminId);
+
+        if (exist?.message_id) {
+          // Edit pesan lama
+          await ctx.telegram.editMessageText(
+            adminId,            // DM ke admin
+            exist.message_id,   // message id tersimpan
+            undefined,
+            text,
+            { parse_mode: "Markdown", ...kb }
+          );
+        } else {
+          // Kirim pertama kali, simpan message_id
+          const sent = await ctx.telegram.sendMessage(adminId, text, { parse_mode: "Markdown", ...kb });
+          upsertReportMsg.run(chat.id, actor.id, adminId, sent.message_id);
         }
+      } catch (e) {
+        // 403: admin belum pernah /start bot di DM → abaikan
       }
-    } catch (e) {
-      console.error("send to admins error:", e);
     }
 
-    // (Opsional) juga umumkan ringkas di grup (non-spam)
+    // (Opsional) Umumkan ringkas di grup:
     // await ctx.telegram.sendMessage(
     //   chat.id,
     //   `➕ ${mention(actor)} menambahkan ${mention(newm.user)} • total undangan ${total}`,
