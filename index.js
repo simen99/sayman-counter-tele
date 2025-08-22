@@ -80,8 +80,10 @@ function atUsername(user) {
   return user.username ? `@${user.username}` : `(no username)`;
 }
 function nowTime() {
-  const d = new Date();
-  return d.toTimeString().slice(0,8); // HH:MM:SS
+  return new Date().toLocaleTimeString("id-ID", {
+    hour12: false,
+    timeZone: "Asia/Jakarta"
+  });
 }
 
 // Ambil semua admin manusia di grup (non-bot)
