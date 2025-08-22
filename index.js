@@ -6,6 +6,9 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const PORT = process.env.PORT || 3000;
 
+// --- DB path pakai Volume (disarankan set: DB_PATH=/data/data.db di Railway) ---
+const DB_PATH = process.env.DB_PATH || "data.db";
+
 if (!BOT_TOKEN || !WEBHOOK_URL) {
   console.error("Harap set BOT_TOKEN dan WEBHOOK_URL di environment.");
   process.exit(1);
@@ -17,7 +20,11 @@ await bot.telegram.setWebhook(WEBHOOK_URL, {
 });
 
 // ---------- DB ----------
-const db = new Database("data.db");
+const db = new Database(DB_PATH);
+// Stabilkan SQLite saat ramai
+db.pragma("journal_mode = WAL");
+db.pragma("synchronous = NORMAL");
+db.pragma("busy_timeout = 3000");
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS invite_counts (
@@ -35,11 +42,16 @@ CREATE TABLE IF NOT EXISTS invite_reports (
   PRIMARY KEY (chat_id, inviter_user_id, admin_user_id)
 );
 
--- Tabel berikut sebenarnya TIDAK dipakai lagi untuk multi-admin,
--- tapi boleh dibiarkan agar tidak mengubah struktur lain.
+-- Sisa kompatibilitas lama (tidak dipakai untuk multi-admin)
 CREATE TABLE IF NOT EXISTS group_admin_receiver (
   chat_id INTEGER PRIMARY KEY,
   admin_user_id INTEGER NOT NULL
+);
+
+-- ON/OFF per grup (default ON = 1)
+CREATE TABLE IF NOT EXISTS group_feature_flags (
+  chat_id INTEGER PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 1
 );
 `);
 
@@ -54,7 +66,7 @@ const resetCount = db.prepare(
   `DELETE FROM invite_counts WHERE chat_id = ? AND inviter_user_id = ?`
 );
 
-// Masih ada biar /start lama tidak error, walau tidak dipakai untuk kirim DM
+// Kompat lama (aman dibiarkan)
 const setAdminReceiver = db.prepare(
   `INSERT INTO group_admin_receiver(chat_id, admin_user_id) VALUES(?, ?)
    ON CONFLICT(chat_id) DO UPDATE SET admin_user_id = excluded.admin_user_id`
@@ -71,6 +83,15 @@ const upsertReportMsg = db.prepare(
    DO UPDATE SET message_id = excluded.message_id`
 );
 
+// ON/OFF per grup
+const getGroupEnabled = db.prepare(
+  `SELECT enabled FROM group_feature_flags WHERE chat_id = ?`
+);
+const setGroupEnabled = db.prepare(
+  `INSERT INTO group_feature_flags(chat_id, enabled) VALUES(?, ?)
+   ON CONFLICT(chat_id) DO UPDATE SET enabled = excluded.enabled`
+);
+
 // ---------- Helper ----------
 function mention(user) {
   const name = [user.first_name, user.last_name].filter(Boolean).join(" ") || user.username || "user";
@@ -80,6 +101,7 @@ function atUsername(user) {
   return user.username ? `@${user.username}` : `(no username)`;
 }
 function nowTime() {
+  // WIB (Asia/Jakarta), 24 jam
   return new Date().toLocaleTimeString("id-ID", {
     hour12: false,
     timeZone: "Asia/Jakarta"
@@ -96,29 +118,51 @@ async function getGroupAdminIds(telegram, chatId) {
 }
 
 function buildReportText({ chat, actor, total }) {
+  const uname = actor.username ? `@${actor.username}` : "(username privat)";
   return (
     `👥 Pengundang : ${mention(actor)}\n` +
-    `🔖 Username Pengundang : ${actor.username ? '@' + actor.username : '(username privat)'}\n` +
+    `🔖 Username Pengundang : ${uname}\n` +
     `📊 Total undangan : ${total}\n` +
     `⏰ Last Update : ${nowTime()}\n` +
     `👥 Grup : ${chat.title || chat.id}`
   );
 }
 
+// Retry helper untuk 429 rate limit (sekali ulang)
+async function safeCall(fn) {
+  try { return await fn(); }
+  catch (e) {
+    const code = e?.response?.error_code || e?.code;
+    if (code === 429) {
+      const ms = (e?.response?.parameters?.retry_after ? e.response.parameters.retry_after * 1000 : 1000);
+      await new Promise(r => setTimeout(r, ms));
+      return await fn();
+    }
+    throw e;
+  }
+}
+
 // ---------- Commands ----------
 bot.command("start", async (ctx) => {
-  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
-    return ctx.reply(
-      "Hi! Tambahkan aku ke grup dan jalankan /start di grup untuk mengaktifkan laporan.\n" +
-      "Hi! Add me to a group and run /start there to enable reports."
-    );
+  // Private: supaya admin bisa terima DM
+  if (ctx.chat?.type === "private") {
+    return ctx.reply("Halo! Sekarang kamu bisa menerima DM laporan kalau jadi admin di grup yang memakai bot ini. Tambahkan aku ke grup & jalankan /start di grup tersebut.");
   }
-  // Boleh dihapus kalau mau bersih total dari single-admin mode
+
+  // Grup: aktifkan & info
+  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") {
+    return ctx.reply("Perintah ini dipakai di grup atau private.");
+  }
+
+  // Kompat lama (tidak dipakai lagi untuk DM target)
   setAdminReceiver.run(ctx.chat.id, ctx.from.id);
+
+  // Pastikan grup ON saat /start
+  setGroupEnabled.run(ctx.chat.id, 1);
 
   await ctx.reply(
     "✅ Bot siap digunakan. Laporan akan dikirim via DM ke semua admin (yang sudah /start bot di DM).\n" +
-    "✅ Bot is ready. Reports will be sent via DM to all group admins (who have /start me in DM).",
+    "Gunakan /off untuk mematikan laporan di grup ini.",
     { parse_mode: "Markdown" }
   );
 });
@@ -130,11 +174,34 @@ bot.command("mystats", async (ctx) => {
   await ctx.replyWithMarkdown(`Total undangan *${c}* untuk ${mention(ctx.from)} di grup ini.`);
 });
 
+// ON/OFF per grup (sesuai permintaan: hanya /off tambahan)
+bot.command("off", async (ctx) => {
+  if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup")
+    return ctx.reply("Jalankan perintah ini di dalam grup.");
+
+  // hanya admin manusia
+  try {
+    const admins = await ctx.telegram.getChatAdministrators(ctx.chat.id);
+    const isAdmin = admins.some(a => a.user.id === ctx.from.id && !a.user.is_bot);
+    if (!isAdmin) return ctx.reply("Hanya admin grup yang bisa mematikan laporan.");
+  } catch {
+    return ctx.reply("Gagal memeriksa admin.");
+  }
+
+  setGroupEnabled.run(ctx.chat.id, 0);
+  await ctx.reply("🔇 Laporan undangan dimatikan untuk grup ini. Jalankan /start untuk mengaktifkan kembali.");
+});
+
 // ---------- Event: member added (manual) ----------
 bot.on("chat_member", async (ctx) => {
   try {
     const upd = ctx.update.chat_member;
     const chat = upd.chat;
+
+    // Skip jika grup OFF
+    const flag = getGroupEnabled.get(chat.id);
+    if (flag && flag.enabled === 0) return;
+
     const newm = upd.new_chat_member;
     const oldm = upd.old_chat_member;
     const actor = upd.from; // si A yang melakukan aksi add
@@ -170,24 +237,38 @@ bot.on("chat_member", async (ctx) => {
 
         if (exist?.message_id) {
           // Edit pesan lama
-          await ctx.telegram.editMessageText(
-            adminId,            // DM ke admin
-            exist.message_id,   // message id tersimpan
-            undefined,
-            text,
-            { parse_mode: "Markdown", ...kb }
+          await safeCall(() =>
+            ctx.telegram.editMessageText(
+              adminId,            // DM ke admin
+              exist.message_id,   // message id tersimpan
+              undefined,
+              text,
+              { parse_mode: "Markdown", ...kb }
+            )
           );
         } else {
           // Kirim pertama kali, simpan message_id
-          const sent = await ctx.telegram.sendMessage(adminId, text, { parse_mode: "Markdown", ...kb });
+          const sent = await safeCall(() =>
+            ctx.telegram.sendMessage(adminId, text, { parse_mode: "Markdown", ...kb })
+          );
           upsertReportMsg.run(chat.id, actor.id, adminId, sent.message_id);
         }
       } catch (e) {
         // 403: admin belum pernah /start bot di DM → abaikan
+        // 400: MESSAGE_ID_INVALID (pesan lama dihapus) → fallback kirim baru
+        const code = e?.response?.error_code || e?.code;
+        if (code === 400) {
+          try {
+            const sent = await safeCall(() =>
+              ctx.telegram.sendMessage(adminId, text, { parse_mode: "Markdown", ...kb })
+            );
+            upsertReportMsg.run(chat.id, actor.id, adminId, sent.message_id);
+          } catch {}
+        }
       }
     }
 
-    // (Opsional) Umumkan ringkas di grup:
+    // (Opsional) Umumkan ringkas di grup (non-spam):
     // await ctx.telegram.sendMessage(
     //   chat.id,
     //   `➕ ${mention(actor)} menambahkan ${mention(newm.user)} • total undangan ${total}`,
@@ -217,6 +298,10 @@ bot.on("callback_query", async (ctx) => {
   resetCount.run(chatId, inviterId);
   await ctx.editMessageText("✅ Counter direset.");
 });
+
+// ---------- Global error guards ----------
+process.on("unhandledRejection", (err) => console.error("UNHANDLED REJECTION:", err));
+process.on("uncaughtException", (err) => console.error("UNCAUGHT EXCEPTION:", err));
 
 // ---------- Webhook server ----------
 const app = express();
